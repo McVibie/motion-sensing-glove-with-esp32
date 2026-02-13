@@ -16,3 +16,7 @@ __pycache__/
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+<<<<<<< HEAD
+=======
+echo "*.code-workspace" >> .gitignore
+>>>>>>> 981035f (Update gitignore and right PlatformIO config)
