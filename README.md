@@ -68,11 +68,24 @@ STOP
 
 ## Repository Structure
 
-motion-sensing-glove-with-esp32/ │ ├── left/ \# Left glove firmware
-(PlatformIO) │ ├── src/main.cpp │ └── platformio.ini │ ├── right/ \#
-Right glove firmware (PlatformIO) │ ├── src/main.cpp │ └──
-platformio.ini │ ├── python/ │ └── read_two_gloves.py \# Dual BLE reader
-│ └── README.md
+```text
+motion-sensing-glove-with-esp32/
+│
+├── left/                     # Left glove firmware (PlatformIO)
+│   ├── src/
+│   │   └── main.cpp
+│   └── platformio.ini
+│
+├── right/                    # Right glove firmware (PlatformIO)
+│   ├── src/
+│   │   └── main.cpp
+│   └── platformio.ini
+│
+├── python/                   # Python BLE host application
+│   └── read_two_gloves.py
+│
+└── README.md
+```
 
 ------------------------------------------------------------------------
 
