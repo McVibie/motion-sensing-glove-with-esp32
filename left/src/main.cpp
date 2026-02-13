@@ -1,3 +1,25 @@
+/*
+ * Motion Sensing Glove - ESP32-S3 (Left glove firmware)
+ *
+ * Hardware:
+ *  - ESP32-S3
+ *  - ICM-20948 IMU over SPI (DMP Quaternion6)
+ *  - 5x flex sensors to ADC pins
+ *
+ * BLE:
+ *  - Nordic UART Service (NUS)
+ *  - TX (Notify/Read):  6E400003-B5A3-F393-E0A9-E50E24DCCA9E
+ *  - RX (Write/WriteNR):6E400002-B5A3-F393-E0A9-E50E24DCCA9E
+ *
+ * Commands (write to RX):
+ *  - CAL   : run calibration (all fingers at once)
+ *  - START : start streaming
+ *  - STOP  : stop streaming
+ *
+ * Stream format (TX notifications):
+ *  IMU,roll,pitch,yaw,S,r1,r2,r3,r4,r5,N,n1,n2,n3,n4,n5
+ */
+
 #include <Arduino.h>
 #include <SPI.h>
 #include "ICM_20948.h"
@@ -46,22 +68,26 @@ static float roll_f = 0.0f, pitch_f = 0.0f, yaw_f = 0.0f;
 static float yaw_prev = 0.0f;
 static float yaw_unwrapped = 0.0f;
 
-static int fingerMin[5] = {0,0,0,0,0};
-static int fingerMax[5] = {4095,4095,4095,4095,4095};
-static float fingerNormF[5] = {0,0,0,0,0};
+static int fingerMin[5] = {0, 0, 0, 0, 0};
+static int fingerMax[5] = {4095, 4095, 4095, 4095, 4095};
+static float fingerNormF[5] = {0, 0, 0, 0, 0};
 
-static const int fingerPins[5] = { PIN_SENSOR_1, PIN_SENSOR_2, PIN_SENSOR_3, PIN_SENSOR_4, PIN_SENSOR_5 };
+static const int fingerPins[5] = {
+  PIN_SENSOR_1, PIN_SENSOR_2, PIN_SENSOR_3, PIN_SENSOR_4, PIN_SENSOR_5
+};
 
 static bool streamingEnabled = true;
 static bool calibrated = false;
 
 static inline float ema(float y, float x, float a) { return y + a * (x - y); }
 static inline float clampf(float x, float lo, float hi) { if (x < lo) return lo; if (x > hi) return hi; return x; }
+
 static inline float map01(int x, int mn, int mx) {
   if (mx == mn) return 0.0f;
   float t = (float)(x - mn) / (float)(mx - mn);
   return clampf(t, 0.0f, 1.0f);
 }
+
 static inline float unwrapYaw(float yaw_deg) {
   float dy = yaw_deg - yaw_prev;
   if (dy > 180.0f)  dy -= 360.0f;
@@ -71,6 +97,10 @@ static inline float unwrapYaw(float yaw_deg) {
   return yaw_unwrapped;
 }
 
+/**
+ * Send a text line over Serial and BLE (NUS TX).
+ * Splits long payloads into smaller chunks for safety.
+ */
 static void bleSendLine(const char* line) {
   SERIAL_PORT.println(line);
 
@@ -79,6 +109,7 @@ static void bleSendLine(const char* line) {
   const size_t maxChunk = 180;
   size_t len = strlen(line);
   size_t i = 0;
+
   while (i < len) {
     size_t n = (len - i > maxChunk) ? maxChunk : (len - i);
     txChar->setValue((uint8_t*)(line + i), n);
@@ -86,6 +117,7 @@ static void bleSendLine(const char* line) {
     i += n;
     delay(2);
   }
+
   txChar->setValue((uint8_t*)"\n", 1);
   txChar->notify();
 }
@@ -148,7 +180,7 @@ static void initBLE() {
   adv->setMinPreferred(0x12);
 
   BLEDevice::startAdvertising();
-  SERIAL_PORT.println("BLE ready, advertising as ESP32_GLOVE...");
+  SERIAL_PORT.println("BLE ready, advertising as ESP32_GLOVE_L");
 }
 
 static void initIMU() {
@@ -180,23 +212,25 @@ static void initIMU() {
   ok &= (myICM.resetFIFO() == ICM_20948_Stat_Ok);
 
   if (!ok) {
-    bleSendLine("MSG,Enable DMP failed! Provjeri ICM_20948_USE_DMP.");
+    bleSendLine("MSG,Enable DMP failed. Check ICM_20948_USE_DMP.");
     while (1) delay(1000);
   }
 
   bleSendLine("MSG,DMP enabled.");
 }
 
-static void readAllRaw(int outRaw[5]) {
-  for (int i = 0; i < 5; i++) outRaw[i] = analogRead(fingerPins[i]);
-}
-
+/**
+ * Calibration (all sensors at once):
+ *  - Wait CAL_PREP_MS so the user can prepare
+ *  - Hold all fingers bent for CAL_HOLD_MS -> record maximum values
+ *  - Hold all fingers straight for CAL_HOLD_MS -> record minimum values
+ */
 static void calibrateAllAtOnce() {
   streamingEnabled = false;
   calibrated = false;
 
   bleSendLine("MSG,CALIBRATION START");
-  bleSendLine("MSG,Priprema... za 5 sekundi pocinje (drzi ruku spremno).");
+  bleSendLine("MSG,Prepare... calibration begins in 5 seconds.");
   delay(CAL_PREP_MS);
 
   for (int i = 0; i < 5; i++) {
@@ -204,7 +238,7 @@ static void calibrateAllAtOnce() {
     fingerMin[i] = 4095;
   }
 
-  bleSendLine("MSG,FAZA 1/2: Drzi SVE prste SAVINUTE 5s...");
+  bleSendLine("MSG,PHASE 1/2: Hold ALL fingers BENT for 5 seconds...");
   unsigned long t1 = millis();
   while (millis() - t1 < CAL_HOLD_MS) {
     for (int i = 0; i < 5; i++) {
@@ -214,7 +248,7 @@ static void calibrateAllAtOnce() {
     delay(CAL_SAMPLE_MS);
   }
 
-  bleSendLine("MSG,FAZA 2/2: Drzi SVE prste ISPRUZENE 5s...");
+  bleSendLine("MSG,PHASE 2/2: Hold ALL fingers STRAIGHT for 5 seconds...");
   unsigned long t2 = millis();
   while (millis() - t2 < CAL_HOLD_MS) {
     for (int i = 0; i < 5; i++) {
@@ -233,18 +267,17 @@ static void calibrateAllAtOnce() {
   }
 
   char buf[200];
-  snprintf(buf, sizeof(buf),
-           "CAL,MIN,%d,%d,%d,%d,%d",
+
+  snprintf(buf, sizeof(buf), "CAL,MIN,%d,%d,%d,%d,%d",
            fingerMin[0], fingerMin[1], fingerMin[2], fingerMin[3], fingerMin[4]);
   bleSendLine(buf);
 
-  snprintf(buf, sizeof(buf),
-           "CAL,MAX,%d,%d,%d,%d,%d",
+  snprintf(buf, sizeof(buf), "CAL,MAX,%d,%d,%d,%d,%d",
            fingerMax[0], fingerMax[1], fingerMax[2], fingerMax[3], fingerMax[4]);
   bleSendLine(buf);
 
   bleSendLine("CALDONE");
-  bleSendLine("MSG,Calibration done. Streaming will start.");
+  bleSendLine("MSG,Calibration complete. Streaming resumed.");
   calibrated = true;
   streamingEnabled = true;
 }
@@ -258,15 +291,16 @@ static void processCmd(const String& cmd) {
   }
   if (cmd == "STOP") {
     streamingEnabled = false;
-    bleSendLine("MSG,Streaming STOP");
+    bleSendLine("MSG,Streaming stopped.");
     return;
   }
   if (cmd == "START") {
     streamingEnabled = true;
-    bleSendLine("MSG,Streaming START");
+    bleSendLine("MSG,Streaming started.");
     return;
   }
-  bleSendLine("MSG,Unknown cmd. Use CAL / START / STOP");
+
+  bleSendLine("MSG,Unknown command. Use CAL / START / STOP.");
 }
 
 void setup() {
@@ -276,7 +310,7 @@ void setup() {
   uint32_t t0 = millis();
   while (!SERIAL_PORT && (millis() - t0 < SERIAL_USB_WAIT_MS)) delay(10);
 
-  SERIAL_PORT.println("Boot: Flex(5) + ICM-20948(DMP SPI) + BLE NUS");
+  SERIAL_PORT.println("Boot: Flex(5) + ICM-20948 (DMP SPI) + BLE NUS");
 
   analogReadResolution(ADC_RESOLUTION);
   for (int i = 0; i < 5; i++) pinMode(fingerPins[i], INPUT);
