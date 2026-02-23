@@ -13,8 +13,10 @@
  *
  * Commands (write to RX):
  *  - CAL   : run calibration (all fingers at once)
- *  - START : start streaming
+ *  - START : start streaming (requires calibration)
  *  - STOP  : stop streaming
+ *  - CAL?  : calibration status
+ *  - CLEAR : clear saved calibration (NVS)
  *
  * Stream format (TX notifications):
  *  IMU,roll,pitch,yaw,S,r1,r2,r3,r4,r5,N,n1,n2,n3,n4,n5
@@ -29,6 +31,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+
+#include <Preferences.h>
 
 #define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHAR_TX_UUID        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -79,6 +83,40 @@ static const int fingerPins[5] = {
 static bool streamingEnabled = true;
 static bool calibrated = false;
 
+static Preferences prefs;
+
+static void saveCalibrationToNVS() {
+  prefs.begin("glove", false);
+  prefs.putBool("cal_ok", true);
+  prefs.putBytes("fmin", fingerMin, sizeof(fingerMin));
+  prefs.putBytes("fmax", fingerMax, sizeof(fingerMax));
+  prefs.end();
+}
+
+static bool loadCalibrationFromNVS() {
+  prefs.begin("glove", true);
+  bool ok = prefs.getBool("cal_ok", false);
+  if (ok) {
+    size_t n1 = prefs.getBytes("fmin", fingerMin, sizeof(fingerMin));
+    size_t n2 = prefs.getBytes("fmax", fingerMax, sizeof(fingerMax));
+    if (n1 != sizeof(fingerMin) || n2 != sizeof(fingerMax)) ok = false;
+  }
+  prefs.end();
+
+  if (!ok) return false;
+
+  for (int i = 0; i < 5; i++) {
+    if (fingerMax[i] <= fingerMin[i]) return false;
+  }
+  return true;
+}
+
+static void clearCalibrationNVS() {
+  prefs.begin("glove", false);
+  prefs.clear();
+  prefs.end();
+}
+
 static inline float ema(float y, float x, float a) { return y + a * (x - y); }
 static inline float clampf(float x, float lo, float hi) { if (x < lo) return lo; if (x > hi) return hi; return x; }
 
@@ -97,10 +135,6 @@ static inline float unwrapYaw(float yaw_deg) {
   return yaw_unwrapped;
 }
 
-/**
- * Send a text line over Serial and BLE (NUS TX).
- * Splits long payloads into smaller chunks for safety.
- */
 static void bleSendLine(const char* line) {
   SERIAL_PORT.println(line);
 
@@ -219,12 +253,6 @@ static void initIMU() {
   bleSendLine("MSG,DMP enabled.");
 }
 
-/**
- * Calibration (all sensors at once):
- *  - Wait CAL_PREP_MS so the user can prepare
- *  - Hold all fingers bent for CAL_HOLD_MS -> record maximum values
- *  - Hold all fingers straight for CAL_HOLD_MS -> record minimum values
- */
 static void calibrateAllAtOnce() {
   streamingEnabled = false;
   calibrated = false;
@@ -278,6 +306,8 @@ static void calibrateAllAtOnce() {
 
   bleSendLine("CALDONE");
   bleSendLine("MSG,Calibration complete. Streaming resumed.");
+
+  saveCalibrationToNVS();
   calibrated = true;
   streamingEnabled = true;
 }
@@ -295,12 +325,28 @@ static void processCmd(const String& cmd) {
     return;
   }
   if (cmd == "START") {
+    if (!calibrated) {
+      streamingEnabled = false;
+      bleSendLine("MSG,No calibration. Send CAL first.");
+      return;
+    }
     streamingEnabled = true;
     bleSendLine("MSG,Streaming started.");
     return;
   }
+  if (cmd == "CAL?") {
+    bleSendLine(calibrated ? "MSG,CAL=OK" : "MSG,CAL=NOT_SET");
+    return;
+  }
+  if (cmd == "CLEAR") {
+    clearCalibrationNVS();
+    calibrated = false;
+    streamingEnabled = false;
+    bleSendLine("MSG,Calibration cleared. Send CAL.");
+    return;
+  }
 
-  bleSendLine("MSG,Unknown command. Use CAL / START / STOP.");
+  bleSendLine("MSG,Unknown command. Use CAL / START / STOP / CAL? / CLEAR.");
 }
 
 void setup() {
@@ -318,8 +364,18 @@ void setup() {
   initBLE();
   initIMU();
 
-  bleSendLine("MSG,Connected. Send 'CAL' to calibrate (all fingers at once).");
-  bleSendLine("MSG,Then it will stream: IMU,roll,pitch,yaw,S,r1..r5,N,n1..n5");
+  if (loadCalibrationFromNVS()) {
+    calibrated = true;
+    streamingEnabled = true;
+    bleSendLine("MSG,Loaded calibration from flash.");
+  } else {
+    calibrated = false;
+    streamingEnabled = false;
+    bleSendLine("MSG,No calibration in flash. Send CAL to calibrate.");
+  }
+
+  bleSendLine("MSG,Connected. Commands: CAL / START / STOP / CAL? / CLEAR");
+  bleSendLine("MSG,Stream format: IMU,roll,pitch,yaw,S,r1..r5,N,n1..n5");
 }
 
 void loop() {
