@@ -8,20 +8,19 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// Nordic UART Service UUIDs
+#include <Preferences.h>
+
 #define SERVICE_UUID   "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHAR_TX_UUID   "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // Notify + Read (ESP32 -> PC)
-#define CHAR_RX_UUID   "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // Write / WriteNoResp (PC -> ESP32)
+#define CHAR_TX_UUID   "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHAR_RX_UUID   "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
 static BLECharacteristic* txChar = nullptr;
 static bool deviceConnected = false;
 
-// Serial settings
 #define SERIAL_PORT        Serial
 #define SERIAL_BAUDRATE    115200
 #define SERIAL_USB_WAIT_MS 1500
 
-// Flex sensor ADC pins (5 sensors)
 #define PIN_SENSOR_1   4
 #define PIN_SENSOR_2   5
 #define PIN_SENSOR_3   6
@@ -29,32 +28,26 @@ static bool deviceConnected = false;
 #define PIN_SENSOR_5   8
 #define ADC_RESOLUTION  12
 
+#define CAL_PREP_MS    5000
+#define CAL_HOLD_MS    5000
+#define CAL_SAMPLE_MS  5
 
-#define CAL_PREP_MS    5000   // time for the user to prepare
-#define CAL_HOLD_MS    5000   // hold pose duration (bent / straight)
-#define CAL_SAMPLE_MS  5      // sampling delay during calibration
-
-// IMU SPI pins (ICM-20948)
 #define IMU_PIN_SCK    12
 #define IMU_PIN_MOSI   11
 #define IMU_PIN_MISO   13
 #define IMU_PIN_CS     10
 
-
 #define LOOP_DELAY_MS        20
 #define ANGLE_FILTER_ALPHA   0.15f
 #define FLEX_FILTER_ALPHA    0.20f
 
-// Global objects
 static SPIClass SPI_PORT(FSPI);
 static ICM_20948_SPI myICM;
 
-// Filtered orientation outputs 
 static float roll_f = 0.0f, pitch_f = 0.0f, yaw_f = 0.0f;
 static float yaw_prev = 0.0f;
 static float yaw_unwrapped = 0.0f;
 
-// Flex calibration ranges and filtered normalized values
 static int fingerMin[5]  = {0, 0, 0, 0, 0};
 static int fingerMax[5]  = {4095, 4095, 4095, 4095, 4095};
 static float fingerNormF[5] = {0, 0, 0, 0, 0};
@@ -65,6 +58,40 @@ static const int fingerPins[5] = {
 
 static bool streamingEnabled = true;
 static bool calibrated = false;
+
+static Preferences prefs;
+
+static void saveCalibrationToNVS() {
+  prefs.begin("glove", false);
+  prefs.putBool("cal_ok", true);
+  prefs.putBytes("fmin", fingerMin, sizeof(fingerMin));
+  prefs.putBytes("fmax", fingerMax, sizeof(fingerMax));
+  prefs.end();
+}
+
+static bool loadCalibrationFromNVS() {
+  prefs.begin("glove", true);
+  bool ok = prefs.getBool("cal_ok", false);
+  if (ok) {
+    size_t n1 = prefs.getBytes("fmin", fingerMin, sizeof(fingerMin));
+    size_t n2 = prefs.getBytes("fmax", fingerMax, sizeof(fingerMax));
+    if (n1 != sizeof(fingerMin) || n2 != sizeof(fingerMax)) ok = false;
+  }
+  prefs.end();
+
+  if (!ok) return false;
+
+  for (int i = 0; i < 5; i++) {
+    if (fingerMax[i] <= fingerMin[i]) return false;
+  }
+  return true;
+}
+
+static void clearCalibrationNVS() {
+  prefs.begin("glove", false);
+  prefs.clear();
+  prefs.end();
+}
 
 static inline float ema(float y, float x, float a) { return y + a * (x - y); }
 
@@ -89,7 +116,6 @@ static inline float unwrapYaw(float yaw_deg) {
   return yaw_unwrapped;
 }
 
-// Send one text line to Serial and over BLE notifications 
 static void bleSendLine(const char* line) {
   SERIAL_PORT.println(line);
 
@@ -111,7 +137,6 @@ static void bleSendLine(const char* line) {
   txChar->notify();
 }
 
-// BLE server callbacks
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) override {
     (void)pServer;
@@ -125,10 +150,8 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-// Last received command 
 static String g_lastCmd;
 
-// BLE RX characteristic callback 
 class RXCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pChar) override {
     std::string rx = pChar->getValue();
@@ -144,7 +167,6 @@ class RXCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-// BLE init
 static void initBLE() {
   BLEDevice::init("ESP32_GLOVE_R");
 
@@ -177,7 +199,6 @@ static void initBLE() {
   SERIAL_PORT.println("BLE ready, advertising as ESP32_GLOVE_R");
 }
 
-// IMU init
 static void initIMU() {
   pinMode(IMU_PIN_CS, OUTPUT);
   digitalWrite(IMU_PIN_CS, HIGH);
@@ -214,9 +235,6 @@ static void initIMU() {
   bleSendLine("MSG,DMP enabled.");
 }
 
-// Calibrate all flex sensors at once:
-//  1.hold all fingers bent 
-//  2.hold all fingers straight 
 static void calibrateAllAtOnce() {
   streamingEnabled = false;
   calibrated = false;
@@ -250,7 +268,6 @@ static void calibrateAllAtOnce() {
     delay(CAL_SAMPLE_MS);
   }
 
-  // Ensure min/max ordering is correct
   for (int i = 0; i < 5; i++) {
     if (fingerMax[i] < fingerMin[i]) {
       int tmp = fingerMin[i];
@@ -270,6 +287,7 @@ static void calibrateAllAtOnce() {
 
   bleSendLine("CALDONE");
   bleSendLine("MSG,Calibration complete. Streaming resumed.");
+  saveCalibrationToNVS();
   calibrated = true;
   streamingEnabled = true;
 }
@@ -281,18 +299,38 @@ static void processCmd(const String& cmd) {
     calibrateAllAtOnce();
     return;
   }
+
   if (cmd == "STOP") {
     streamingEnabled = false;
     bleSendLine("MSG,Streaming stopped.");
     return;
   }
+
   if (cmd == "START") {
+    if (!calibrated) {
+      streamingEnabled = false;
+      bleSendLine("MSG,No calibration. Send CAL first.");
+      return;
+    }
     streamingEnabled = true;
     bleSendLine("MSG,Streaming started.");
     return;
   }
 
-  bleSendLine("MSG,Unknown command. Use CAL / START / STOP.");
+  if (cmd == "CAL?") {
+    bleSendLine(calibrated ? "MSG,CAL=OK" : "MSG,CAL=NOT_SET");
+    return;
+  }
+
+  if (cmd == "CLEAR") {
+    clearCalibrationNVS();
+    calibrated = false;
+    streamingEnabled = false;
+    bleSendLine("MSG,Calibration cleared. Send CAL.");
+    return;
+  }
+
+  bleSendLine("MSG,Unknown command. Use CAL / START / STOP / CAL? / CLEAR.");
 }
 
 void setup() {
@@ -310,7 +348,17 @@ void setup() {
   initBLE();
   initIMU();
 
-  bleSendLine("MSG,Connected. Send 'CAL' to calibrate (all fingers at once).");
+  if (loadCalibrationFromNVS()) {
+    calibrated = true;
+    streamingEnabled = true;
+    bleSendLine("MSG,Loaded calibration from flash.");
+  } else {
+    calibrated = false;
+    streamingEnabled = false;
+    bleSendLine("MSG,No calibration in flash. Send 'CAL' to calibrate.");
+  }
+
+  bleSendLine("MSG,Connected. Commands: CAL / START / STOP / CAL? / CLEAR");
   bleSendLine("MSG,Stream format: IMU,roll,pitch,yaw,S,r1..r5,N,n1..n5");
 }
 
@@ -341,7 +389,6 @@ void loop() {
 
   if ((myICM.status == ICM_20948_Stat_Ok) || (myICM.status == ICM_20948_Stat_FIFOMoreDataAvail)) {
     if ((data.header & DMP_header_bitmap_Quat6) > 0) {
-
       double q1 = ((double)data.Quat6.Data.Q1) / 1073741824.0;
       double q2 = ((double)data.Quat6.Data.Q2) / 1073741824.0;
       double q3 = ((double)data.Quat6.Data.Q3) / 1073741824.0;
@@ -362,7 +409,6 @@ void loop() {
       double qy = q1;
       double qz = -q3;
 
-
       double t0r = +2.0 * (qw*qx + qy*qz);
       double t1r = +1.0 - 2.0 * (qx*qx + qy*qy);
       double roll  = atan2(t0r, t1r) * 180.0 / PI;
@@ -376,7 +422,6 @@ void loop() {
       double t4y = +1.0 - 2.0 * (qy*qy + qz*qz);
       double yaw = atan2(t3y, t4y) * 180.0 / PI;
 
-      
       if (!isfinite(roll) || !isfinite(pitch) || !isfinite(yaw)) {
         delay(1);
         return;
